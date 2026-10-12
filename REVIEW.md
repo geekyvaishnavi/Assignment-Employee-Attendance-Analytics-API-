@@ -1,9 +1,44 @@
 # REVIEW.md
 
-List every defect you found in the starter `app/main.py` (helpers and endpoints). For each one:
+Line numbers refer to the original starter `app/main.py`.
 
 | # | Where (function / line) | What is wrong | How you'd notice it (test, input, or symptom) | How you fixed it |
 |---|---|---|---|---|
-| 1 | | | | |
+| 1 | module setup, L22-23 | `MongoClient` is not `tz_aware`, so stored instants come back as naive datetimes; mixing them with IST-aware values raises `TypeError` or silently shifts by 5:30. Connection details have hard-coded fallbacks. | Read a seeded record and compare `punch_in` with an aware datetime: `TypeError: can't compare offset-naive and offset-aware datetimes` (500). | `MongoClient(..., tz_aware=True)`; `MONGO_URI` / `MONGO_DB` read from the environment with no fallback. |
+| 2 | module setup | No indexes are created. `emp_code` is not unique, `(emp_code, date)` is not unique, and every list query is a COLLSCAN. | `explain` on `GET /attendance` shows `COLLSCAN`; parallel duplicate creates both succeed. | `ensure_indexes()` in the FastAPI `lifespan`: unique `emp_code`, `(department, emp_code)`, unique `(emp_code, date)`, `(date desc, emp_code asc)`. `create_index` is idempotent. |
+| 3 | `compute_late_minutes`, L33-37 | Grace check compares whole minutes (`minutes > 10`), so anything from 10:00 to 10:59 after shift start counts as on time. | Shift 09:30, punch 09:40:01 -> returns 0, R2 says 10. Punch 09:40:30 -> 0, should be 10. | Compare seconds: late if `seconds > 600`, then `seconds // 60`. |
+| 4 | `compute_late_minutes`, L35 | `punch_in.replace(hour, minute)` applies the shift time in whatever zone `punch_in` has (server-local or UTC), not IST. | With a UTC `punch_in` of 04:35Z (10:05 IST), shift start becomes 09:30Z -> negative -> 0 instead of 35. | Build shift start with `datetime.combine(day, shift_start, IST)` and subtract aware datetimes. |
+| 5 | `compute_late_minutes` | Overnight shifts: shift start is taken on the punch's own calendar day. | Shift 22:00-06:00, punch 00:30 IST -> shift start = 22:00 the same day -> negative -> 0; should be 150. | Late is computed from the start of the shift of the *attendance date* (R1), via `attendance_date()` + `shift_bounds()`. |
+| 6 | `compute_work_hours`, L40-41 | `round()` is banker's/binary-float rounding, not half-up (R4). | 4050 s = 1.125 h -> `round(1.125, 2)` = 1.12; contract says 1.13. | `Decimal(seconds) / 3600` quantized with `ROUND_HALF_UP`; seconds are whole because instants are truncated. |
+| 7 | `compute_overtime`, L44-47 | No 30-minute minimum (R3). | Shift end 18:30, punch-out 18:35 -> 5; should be 0. | Return `minutes if minutes >= 30 else 0`. |
+| 8 | `compute_overtime`, L46 | Overnight shift end is placed on the start day instead of the next day. | Shift 22:00-06:00 on 07-06, out 07-07 06:40 -> ~1480 min; should be 40. | `shift_bounds()` adds one day to the end of an overnight shift. |
+| 9 | `compute_overtime`, L46-47 | `end` is IST-aware but the starter's punch times are naive -> subtraction raises `TypeError`. | Any punch-out built from the starter's `punch_in` -> 500. | All instants are UTC-aware end to end (fix 1, 12). |
+| 10 | all helpers / punch-in | Instants are never truncated to whole seconds (R1). | `punched_at = ...:40:00.900` is stored and returned with `.900`. | `ms_to_dt()` does `ms // 1000`; the truncated value is stored and returned. |
+| 11 | `EmployeeIn`, L53-60 | No validation: any `emp_code`, email, shift time or date is accepted; `shift_start == shift_end` is accepted. | `POST /employees` with `emp_code:"abc"`, `shift_start:"25:99"`, `joined_on:"2026-02-30"` -> 201 instead of 422. | Field patterns/lengths from `openapi.yaml`, a real-date check on `joined_on`, and a model validator for `shift_start != shift_end`. |
+| 12 | `PunchInIn.punched_at`, L65 | Lax `int`: Pydantic accepts `"1783312500000"` and `1783312500000.0`; seconds-looking values such as `1783312500` are accepted and land in 1970. | Each of those bodies returns 201; contract says 422. | `StrictInt` with `ge=100000000000`, `le=4102444800000`. |
+| 13 | `PunchInIn.status`, L66 | Any string accepted, including `ABSENT`, `LEAVE`, `"foo"`. | `{"status":"ABSENT"}` -> 201 with an ABSENT record that has a punch-in. | `Literal["PRESENT","WFH","ON_DUTY"]`. |
+| 14 | `health`, L72-74 | Always 200; never talks to MongoDB. | Stop MongoDB -> `/health` still says ok. | `client.admin.command("ping")`; `PyMongoError` -> 503. |
+| 15 | `create_employee`, L79-80 | Check-then-insert: two concurrent creates can both pass `find_one` and both insert. | Fire 10 parallel identical creates -> more than one 201, duplicate `emp_code`s. | Unique index + catch `DuplicateKeyError` -> 409. |
+| 16 | `create_employee`, L82 | `datetime.now()` is naive server-local time; MongoDB stores it as if it were UTC. | On an IST machine `created_at` is stored 5:30 in the future. | `datetime.now(timezone.utc)`. |
+| 17 | `create_employee`, L85 | Response returns `created_at` as a datetime string, not epoch ms. | Response has `"created_at": "2026-..."`; contract wants an integer. | `employee_out()` serializer converts with `dt_to_ms()`. |
+| 18 | `list_employees`, L93 | `skip = page * page_size` is off by one page. | 25 employees, `page=1` -> returns 5 rows (rows 21-25) instead of rows 1-20. | `skip = (page - 1) * page_size`. |
+| 19 | `list_employees`, L94 | `total` counts the whole collection, ignoring the department filter (R10). | `?department=Sales` with 2 Sales of 6 -> `total: 6`. | `count_documents(q)`. |
+| 20 | `list_employees`, L95 | No sort, so order is natural order, not `emp_code` ascending. | Insert EMP0002 then EMP0001 -> list shows EMP0002 first. | `.sort("emp_code", 1)` backed by the unique index. |
+| 21 | `list_employees`, `list_attendance` | `page` / `page_size` unvalidated (R10). | `page=0` -> negative skip -> 500; `page_size=5000` accepted. | `Query(ge=1)` for page, `Query(ge=1, le=100)` for page_size. |
+| 22 | `punch_in`, L101 / L113 | Unknown employee: `emp` is `None`, `emp["shift_start"]` raises -> 500. | Punch in as `EMP9999` -> 500 Internal Server Error. | `if emp is None: 404`. |
+| 23 | `punch_in`, L102-103 | `fromtimestamp()` uses the server's zone, so the attendance date is the server-local date, not the IST date; overnight rule ignored (R1). | Server in UTC, punch 02:00 IST on 07-07 -> stored as `date: 07-06`. Overnight 00:30 punch gets the next day's date. | `attendance_date()`: IST date of punch_in, minus one day for an overnight-shift punch before `shift_end`. |
+| 24 | `punch_in`, L104-105 | Check-then-insert race; two simultaneous punch-ins both get 201 and create two records. | 10 parallel identical punch-ins -> several 201s. | Unique `(emp_code, date)` index; insert and catch `DuplicateKeyError` -> 409. |
+| 25 | `punch_in`, L102 | `if body.punched_at` treats a present-but-falsy value as missing. | `punched_at: 0` silently becomes "now" instead of 422. | Bounds reject it; the code tests `is not None`. |
+| 26 | `punch_in`, L119-121 | Response contains an `id` (internal `_id`), and `punch_in` is a datetime, not epoch ms. | Response has `"id": "66a..."` and `"punch_in": "2026-..."`. | `record_out()` serializer: contract fields only, instants in ms. |
+| 27 | `list_attendance`, L144 | Loads every matching document into Python, sorts and slices in memory. | Slow / memory spike on ~100k records; `explain` shows COLLSCAN. | MongoDB `sort/skip/limit` + `count_documents`, using the `(date desc, emp_code asc)` index. |
+| 28 | `list_attendance`, L145 | Sort is `date` only; contract is `date` desc then `emp_code` asc. | Several employees on one date come back in arbitrary order; pages can overlap. | `sort([("date", -1), ("emp_code", 1)])`. |
+| 29 | `list_attendance`, L148-150 | Returns `id`, raw datetimes, and legacy docs without `history` / `half_day`. | Sample record 9 is returned without `half_day` and `history`. | `record_out()` defaults missing `history` to `[]`, `half_day` to `false`, and converts instants (including inside `history[].changes`). |
+| 30 | `list_attendance`, L125-131 | No validation: bad dates, `date_from > date_to`, unknown `status` are accepted. | `?date_from=2026-07-10&date_to=2026-07-01` -> 200 with nothing; `?status=foo` -> 200. | `DateStr` type, `Status` literal, and an explicit 422 for `date_from > date_to` in FastAPI's default error shape. |
 
-Also note anything you looked at and decided was **not** a defect, and why.
+## Looked at and decided were not defects
+
+- **`load_dotenv()`**: its default is `override=False`, so real environment variables already win over `.env`, as the contract requires.
+- **Sync `def` endpoints**: FastAPI runs them in a thread pool and `MongoClient` is thread-safe, so parallel requests are fine. The races came from check-then-insert, not from sync code.
+- **`int(x / 60)` truncating towards zero instead of flooring**: only differs for negative values, which become 0 anyway. Replaced by integer seconds `// 60` for clarity.
+- **`doc.pop("_id")` after `insert_one`**: correct as written (`insert_one` mutates the dict). Made redundant by the explicit serializers.
+- **Extra fields in request bodies** (for example a client sending `work_hours`): Pydantic ignores unknown fields by default, which is what the contract asks for ("ignore it").
